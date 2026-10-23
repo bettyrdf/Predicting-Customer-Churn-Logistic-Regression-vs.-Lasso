@@ -1,0 +1,264 @@
+---
+title: "Predicting Customer Churn: Logistic Regression vs. Lasso"
+author: "Betty Rudolf"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+# install.packages(c("modeldata", "glmnet", "caret", "pROC"))
+library(modeldata)
+library(glmnet)      
+library(pROC)        
+library(caret)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Question and data
+
+The business question is which customers are about to leave, so that the company can contact them before they do (for example with a discount or a call). A customer who leaves is lost revenue, whereas a retention offer to a customer who would have stayed only costs the offer. Missing a churner is therefore the more expensive mistake. A useful model should find as many churners as possible without flagging too many loyal customers.
+
+```{r data}
+churn <- modeldata::mlc_churn
+dim(churn)
+str(churn) 
+head(churn)
+churn <- subset(churn, select = -c(state, area_code))
+head(churn)
+
+anyNA(churn)   
+summary(churn)
+```
+
+The data set (mlc_churn, 5,000 customers, 14.1% churners) contains the account length, an international-plan and a voice-mail-plan indicator, call minutes, call counts and charges for day, evening, night and international calls, and the number of customer service calls. According to the package documentation the data are artificial, so results may not transfer to real customers. For each of the four call types, minutes and charge are almost perfectly correlated (|cor| >= 0.9999): the charge is the minutes times a fixed price per minute. Keeping both would make the glm coefficients unstable, so the four charge columns were dropped. state and area_code were dropped to avoid many dummy variables.
+
+```{r explore}
+num.cols <- sapply(churn, is.numeric)      
+cor.mat  <- round(cor(churn[, num.cols]), 2)
+high <- which(abs(cor.mat) > 0.9 & upper.tri(cor.mat), arr.ind = TRUE) 
+data.frame(var1 = rownames(cor.mat)[high[, 1]],
+           var2 = colnames(cor.mat)[high[, 2]],
+           cor  = round(cor.mat[high], 3))  
+
+churn <- subset(churn, select = -c(total_day_charge, total_eve_charge, total_night_charge, total_intl_charge))
+head(churn)
+
+
+rate <- tapply(churn$churn == "yes", churn$number_customer_service_calls, mean)
+
+barplot(rate, col = "grey80", border = "white",
+        xlab = "Customer service calls", ylab = "Churn rate",
+        main = "Churn rate by number of service calls")
+abline(h = mean(churn$churn == "yes"), col = "firebrick", lwd = 2)  
+
+rate.int <- tapply(churn$churn == "yes", churn$international_plan, mean)
+
+barplot(rate.int, col = "grey80", border = "white",
+        ylab = "Churn rate", main = "Churn rate by international plan")
+abline(h = mean(churn$churn == "yes"), col = "firebrick", lwd = 2)
+
+table(churn$number_customer_service_calls)
+```
+
+Before fitting any model, the plots check whether the predictors carry a signal at all. The red line is the overall churn rate (14.1%), the reference every bar has to be compared with. Churn is flat at about 11% for 0 to 3 service calls and jumps to about 44% at 4 calls and above 60% at 5 and 6 calls (customers with 4 or more calls churn at 50% versus 11% for the others); only 17 customers have 7 or more calls, so those bars are noisy. Customers with an international plan churn at 42%, compared with 11% without one, so both variables look informative before any model is fitted.
+
+# 2. The benchmark: compared to what?
+
+```{r benchmark}
+table(churn$churn)
+prop.table(table(churn$churn))     
+mean(churn$churn == "yes")         
+
+churn$churn <- factor(churn$churn, levels = c("no", "yes")) # glm models the 2nd level -> "yes" last
+levels(churn$churn)        
+contrasts(churn$churn)     
+
+1 - max(table(churn$churn)) / length(churn$churn)
+```
+
+A model that always predicts "no" is wrong for 14.1% of all customers (13.6% on the test set used later), so it reaches an accuracy of about 86% without finding a single churner. Every model below has to beat this error rate, and since an error rate alone rewards ignoring the churners, it is also judged by sensitivity.
+
+# 3. Logistic regression on a train/test split
+
+The model is fitted to the training data, so it has already "seen" these customers and the training error is optimistically low, in particular for flexible models, because it also rewards fitting noise. Therefore, the training error does not tell us how the model performs on new customers, only the error on held-out test data
+estimates this.
+
+
+```{r split}
+set.seed(2)
+
+n     <- nrow(churn)
+train <- sample(n, n/2)          
+test.y <- churn$churn[- train]       
+table(test.y)  
+```
+
+```{r logit}
+logit.fit <- glm(churn ~ ., family = binomial, data = churn[train, ])
+
+summary(logit.fit)
+z <- coef(summary(logit.fit))[, "z value"]
+sort(abs(z), decreasing = TRUE)
+
+exp(coef(logit.fit)["international_planyes"])
+```
+
+The coefficient of international_planyes is 2.21, and exp(2.21) = 9.09. Holding all other variables fixed, customers with an international plan have 9.09 times the odds of churning (the odds are p / (1 - p), so this is not nine times the probability).
+
+```{r logit-eval}
+logit.probs <- predict(logit.fit, churn[-train, ], type = "response")
+logit.pred  <- factor(ifelse(logit.probs > 0.5, "yes", "no"),
+                      levels = levels(churn$churn))
+
+table(Predicted = logit.pred, True = test.y)
+mean(logit.pred != test.y)          
+mean(test.y == "yes")                 
+
+cm <- table(Predicted = logit.pred, True = test.y)
+cm["yes", "yes"] / sum(cm[, "yes"])    
+cm["no", "no"]     / sum(cm[, "no"])   
+confusionMatrix(logit.pred, test.y, positive = "yes")
+```
+
+On this split the logistic regression has a test error of 13.4% against 13.6% for the benchmark, an improvement of only 0.2 percentage points. Its most frequent mistake is missing churners: of the 339 churners in the test set, 272 were not found (sensitivity 20%), while only 62 loyal customers were flagged by mistake (specificity 97%). At a threshold of 0.5 the model only says "yes" when it is very sure, which rarely happens with a churn rate of 14%. This is the more expensive kind of mistake identified in section 1. Because this is a single split, the size of the improvement is checked in section 5.
+
+
+# 4. Lasso logistic regression
+
+Instead of only minimizing the loss, the lasso adds a penalty. This penalty shrinks the coefficients towards zero, which reduces their variance. Because it uses absolute values, some coefficients become exactly zero, so the lasso also selects variables. Lambda controls the strength of the penalty: lambda = 0 gives the ordinary fit, and a large lambda leaves only a few variables in the model. Lambda is chosen by 10-fold cross-validation on the training rows only, so the test set is not touched. I used lambda.1se, the largest lambda whose cross-validation error is within one standard error of the minimum, because it gives a simpler model that is about as good as the best one.
+
+```{r lasso}
+x <- model.matrix(churn ~ ., data = churn)[, -1] # glmnet needs a numeric matrix; [, -1] drops the intercept column  
+y <- churn$churn
+dim(x)   
+
+set.seed(2) # CV folds are random
+cv.fit <- cv.glmnet(x[train, ], y[train], family = "binomial", alpha = 1,
+                    type.measure = "class")    # CV error = misclassification rate
+plot(cv.fit)
+cv.fit$lambda.min
+cv.fit$lambda.1se
+
+coef(cv.fit, s = "lambda.1se")                    
+sum(coef(cv.fit, s = "lambda.1se")[-1] != 0)      
+
+round(cbind(glm   = coef(logit.fit),
+            lasso = coef(cv.fit, s = "lambda.1se")[, 1]), 4)
+```
+
+```{r lasso-eval}
+lasso.probs <- predict(cv.fit, x[-train, ], s = "lambda.1se", type = "response")
+lasso.probs <- as.numeric(lasso.probs)          # predict() returns a MATRIX here
+lasso.pred  <- factor(ifelse(lasso.probs > 0.5, "yes", "no"), levels = levels(y))
+
+table(Predicted = lasso.pred, True = test.y)
+mean(lasso.pred != test.y)             
+
+cm.lasso <- table(Predicted = lasso.pred, True = test.y)
+cm.lasso["yes", "yes"] / sum(cm.lasso[, "yes"])    
+cm.lasso["no", "no"]     / sum(cm.lasso[, "no"])   
+confusionMatrix(lasso.pred, test.y, positive = "yes")
+```
+
+At lambda.1se (0.034) the lasso keeps four of the 13 predictors: international_plan, voice_mail_plan,
+total_day_minutes and number_customer_service_calls, which are also among the most significant in the glm. Its test error on this split is 13.5%, slightly above the glm (13.4%) and just below the benchmark (13.6%). Its sensitivity is only 2.7% (9 of 339 churners): the shrinkage pulls all predicted probabilities towards the base rate of 14%, so almost none exceeds 0.5. The lasso therefore does not improve on the glm here; whether the difference is real is checked in section 5.
+
+# 5. How much can one split be trusted?
+
+Over 100 random 50/50 splits the test error of the logistic regression ranges from 12.4% to 14.7%, so a single split can move the result by about as much as the gap between the models. Comparing the models on the same splits removes this shared noise: a split that happens to put few hard-to-predict customers into the test set lowers the error of every model, but the difference between two models on the same split does not depend on how "easy" the split was.
+
+```{r repeated-splits}
+# The split is an argument, not drawn inside, so that all three methods are evaluated on exactly the same test customers.
+test.errors <- function(train) {
+  test.y <- churn$churn[-train]
+
+  # (a) benchmark
+  bench <- mean(test.y == "yes")
+
+  # (b) logistic regression 
+  fit   <- glm(churn ~ ., family = binomial, data = churn[train, ])
+  probs <- predict(fit, churn[-train, ], type = "response")
+  pred  <- factor(ifelse(probs > 0.5, "yes", "no"), levels = levels(y))
+  logit <- mean(pred != test.y)
+
+  # (c) lasso
+  cv    <- cv.glmnet(x[train, ], y[train], family = "binomial", alpha = 1, type.measure = "class")
+  probs <- as.numeric(predict(cv, x[-train, ], s = "lambda.1se", type = "response"))
+  pred  <- factor(ifelse(probs > 0.5, "yes", "no"), levels = levels(y))                               
+  lasso <- mean(pred != test.y)
+
+  c(benchmark = bench, logit = logit, lasso = lasso)   
+}
+
+set.seed(2)
+test.errors(train) # sanity check: must reproduce the results of sections 3 and 4
+
+set.seed(2)
+errors <- replicate(100, test.errors(sample(n, n/2)))
+dim(errors)            
+
+rowMeans(errors)                 
+apply(errors, 1, sd)             
+summary(t(errors))               
+
+boxplot(t(errors), ylab = "Test error", main = "100 random 50/50 splits")
+
+mean(errors["lasso", ] < errors["logit", ])        
+mean(errors["logit", ] < errors["benchmark", ])        
+summary(errors["lasso", ] - errors["logit", ]) 
+
+```
+
+On average the test error is 14.1% for the benchmark, 13.5% for the logistic regression and 14.0% for the lasso. The logistic regression beats the benchmark on 93% of the splits, but by only about 0.6 percentage points on average, which is comparable to the standard deviation of a single split (about 0.5). The lasso beats the logistic regression on only 16% of the splits and is worse by about 0.5 percentage points on average. I can therefore claim that the logistic regression is slightly but consistently better than always predicting "no", and that the lasso brings no improvement here. I cannot claim a large improvement, and the result applies to this error measure at a threshold of 0.5.
+
+# 6. Ranking customers instead of classifying at 0.5
+
+The model gives every customer a probability of churning, and a threshold turns it into "yes" or "no". The ROC curve shows, for every possible threshold, which share of the churners is found (sensitivity) and which share of the loyal customers is flagged by mistake (1 - specificity). It therefore shows the whole trade-off, whereas an error rate describes only one threshold (here 0.5). The AUC is the area under this curve. It equals the probability that a randomly chosen churner gets a higher predicted probability than a randomly chosen non-churner: 0.5 means guessing, 1 means a perfect ranking.
+
+```{r roc}
+logit.roc <- roc(test.y, logit.probs, levels = c("no", "yes"), direction = "<") # levels = control, case; otherwise the curve is mirrored
+lasso.roc <- roc(test.y, lasso.probs, levels = c("no", "yes"), direction = "<") 
+auc(logit.roc)
+auc(lasso.roc)
+
+plot(logit.roc, col = "black", main = "ROC curves on the test set")
+plot(lasso.roc, col = "firebrick", add = TRUE)      
+legend("bottomright", legend = c("Logistic regression", "Lasso"),
+       col = c("black", "firebrick"), lwd = 2)
+
+low.pred <- factor(ifelse(logit.probs > 0.2, "yes", "no"), levels = levels(y)) # lower threshold chosen a priori, not tuned on the test set
+cm.low   <- table(Predicted = low.pred, True = test.y)
+cm.low
+mean(low.pred != test.y)
+
+cm.low <- table(Predicted = low.pred, True = test.y)
+cm.low["yes", "yes"] / sum(cm.low[, "yes"])   
+cm.low["no", "no"]     / sum(cm.low[, "no"])  
+confusionMatrix(low.pred, test.y, positive = "yes")
+```
+
+The AUC is 0.82 for the logistic regression and 0.80 for the lasso, so both rank customers similarly well even though the lasso finds almost no churners at a threshold of 0.5. Lowering the threshold to 0.2 (chosen before looking at the test error, not tuned on it) raises the sensitivity of the logistic regression from 20% to 67% and lowers the specificity from 97% to 84%; the model then flags 578 instead of 129 customers and the test error rises from 13.4% to 18.6%. A threshold of 0.2 is worth it if one missed churner costs clearly more than one wasted retention offer. The right threshold depends on this cost ratio, which is not in the data.
+
+# 7. Conclusion and limitations
+
+**Main result**
+
+The logistic regression beat the "always no" benchmark on 93% of 100 random splits, but only by about 0.6 percentage points in test error (13.5% vs. 14.1%), and the lasso did not improve on it.
+
+**What I would do with more time**
+
+With more time I would choose the threshold from the real cost of a retention offer and of a lost customer instead of 0.5, run the lasso with the charge columns, state and area_code included, and add a variable for "4 or more service calls", since the churn rate jumps at that point.
+
+**Limitations** 
+
+The data are a single, artificial data set (according to the package documentation), so the results may not hold for real customers; there is no external validation and no cost information; the threshold of 0.2 is an illustration rather than a tuned choice; and the models were compared only with 50/50 splits and error rate, sensitivity and AUC.
+
+
+```{r session}
+sessionInfo()
+```
